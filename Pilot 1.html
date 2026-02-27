@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ROM Research Pro: Protocol Edition</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        :root { 
+            --bg: #000; --panel: #1a1a1a; --primary: #0a84ff; 
+            --success: #30d158; --warning: #ff9f0a; --error: #ff3b30;
+        }
+        body { 
+            background: var(--bg); color: #fff; margin: 0; font-family: -apple-system, sans-serif; 
+            height: 100vh; display: flex; flex-direction: column; overflow: hidden; 
+        }
+        
+        /* ヘッダー：試行回数を表示 */
+        #header { background: var(--panel); padding: 8px 15px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; height: 55px; }
+        #mode-info { display: flex; flex-direction: column; }
+        #mode-display { font-size: 1.1rem; font-weight: 800; color: var(--primary); }
+        #trial-display { font-size: 0.8rem; color: #aaa; }
+
+        /* メインビュー */
+        #main-view { position: relative; flex: 1; background: #000; overflow: hidden; }
+        video { display: none; }
+        canvas { width: 100%; height: 100%; object-fit: contain; transform: scaleX(-1); }
+        canvas.no-mirror { transform: scaleX(1); }
+
+        /* UIオーバーレイ */
+        #ui-layer { position: absolute; inset: 0; pointer-events: none; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; }
+        
+        /* カウントダウン数字 */
+        #countdown-txt { font-size: 4rem; font-weight: 900; color: var(--warning); text-shadow: 0 0 20px #000; display: none; }
+
+        #angle-val { font-size: 8rem; font-weight: 900; line-height: 1; text-shadow: 0 4px 20px #000; font-variant-numeric: tabular-nums; }
+        #stability-container { width: 60%; height: 10px; background: rgba(255,255,255,0.2); margin: 15px 0; border-radius: 5px; overflow: hidden; }
+        #stability-bar { width: 0%; height: 100%; background: var(--success); transition: width 0.1s linear; }
+        #status-msg { font-size: 1.2rem; font-weight: bold; color: #fff; text-shadow: 0 2px 5px #000; text-align: center; height: 30px; }
+
+        /* プロトコル手順バー */
+        #protocol-bar { 
+            display: flex; width: 100%; background: #222; border-top: 1px solid #444; height: 45px; align-items: center; 
+        }
+        .step { flex: 1; text-align: center; font-size: 0.75rem; color: #666; font-weight: bold; transition: 0.3s; }
+        .step.active { color: #fff; font-size: 0.85rem; }
+        .step.active span { background: var(--primary); color: white; padding: 2px 6px; border-radius: 4px; margin-right: 4px; }
+        .step.active.recording span { background: var(--warning); }
+
+        /* コントロール */
+        #controls { background: var(--panel); padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+        .row { display: flex; gap: 6px; }
+        button { flex: 1; padding: 12px 0; border: none; border-radius: 8px; font-size: 13px; font-weight: bold; color: #aaa; background: #2c2c2e; cursor: pointer; }
+        button.active { background: var(--primary); color: white; }
+        .btn-side.active { background: var(--success); }
+        .btn-undo { background: var(--error); color: white; flex: 0.4; }
+
+        #history { font-size: 0.8rem; color: #888; text-align: center; padding: 4px; }
+        #lock-overlay { position: absolute; inset: 0; background: rgba(48, 209, 88, 0.2); display: none; border: 10px solid var(--success); pointer-events: none; z-index: 20; }
+        #start-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.9); z-index: 999; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+    </style>
+</head>
+<body>
+
+<div id="header">
+    <div id="mode-info">
+        <div id="mode-display">右 肘</div>
+        <div id="trial-display">Trial 1</div>
+    </div>
+    <div style="display:flex; gap:8px;">
+        <button style="width:70px; font-size:10px;" onclick="toggleCamera()">📷 反転</button>
+        <button style="width:70px; font-size:10px; background:var(--primary); color:#fff;" onclick="downloadCSV()">💾 CSV</button>
+    </div>
+</div>
+
+<div id="main-view">
+    <div id="start-overlay">
+        <h2 style="margin-bottom:30px;">ROM Pro Research</h2>
+        <button style="padding: 20px 50px; font-size: 1.5rem; border-radius: 50px; background: var(--primary); color: white;" onclick="startSystem()">測定開始</button>
+    </div>
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+    
+    <div id="ui-layer">
+        <div id="countdown-txt">2.5</div>
+        <div id="angle-val">---</div>
+        <div id="stability-container"><div id="stability-bar"></div></div>
+        <div id="status-msg">待機中</div>
+    </div>
+    <div id="lock-overlay"></div>
+</div>
+
+<div id="protocol-bar">
+    <div id="step-1" class="step active"><span>1</span>開始肢位</div>
+    <div id="step-2" class="step"><span>2</span>最大屈曲保持</div>
+    <div id="step-3" class="step"><span>3</span>記録</div>
+</div>
+
+<div id="controls">
+    <div class="row">
+        <button class="btn-side active" id="btn-R" onclick="changeSide('R')">右側 (Right)</button>
+        <button class="btn-side" id="btn-L" onclick="changeSide('L')">左側 (Left)</button>
+        <button class="btn-undo" onclick="undoLast()">↩ 取消</button>
+    </div>
+    <div class="row">
+        <button class="btn-part active" onclick="changePart('Elbow', this)">肘</button>
+        <button class="btn-part" onclick="changePart('Knee', this)">膝</button>
+        <button class="btn-part" onclick="changePart('Shoulder', this)">肩</button>
+        <button class="btn-part" onclick="changePart('Hip', this)">股</button>
+    </div>
+    <div id="history">履歴なし</div>
+</div>
+
+<script>
+    // --- 研究用パラメータ ---
+    const LOCK_TIME = 2500;       // 2.5秒
+    const VELOCITY_THRES = 12;    // 静止判定角速度 (deg/s)
+    const BUFFER_WINDOW_MS = 1000; // 直前1秒の中央値を採用
+    const SMOOTH_LM = 0.4;        // ランドマーク平滑化
+    const SMOOTH_ANG = 0.5;       // 角度表示の滑らかさ
+
+    let currentSide = 'R', currentPart = 'Elbow', currentTrial = 1;
+    let isLocked = false, stableStartTime = 0;
+    let angleHistory = [], lastRawAngle = null, lastTimestamp = Date.now();
+    let prevLandmarks = null, smoothAngle = null;
+    let poseInstance = null, cameraInstance = null, useFrontCamera = true;
+    let romData = JSON.parse(localStorage.getItem('rom_research_v3') || '[]');
+
+    const JOINTS = {
+        Elbow: { R:[12,14,16], L:[11,13,15] }, Knee: { R:[24,26,28], L:[23,25,27] },
+        Shoulder: { R:[24,12,14], L:[23,11,13] }, Hip: { R:[12,24,26], L:[11,23,25] }
+    };
+
+    const video = document.getElementById('input_video');
+    const canvas = document.getElementById('output_canvas');
+    const ctx = canvas.getContext('2d');
+
+    async function startSystem() {
+        document.getElementById('start-overlay').style.display = 'none';
+        poseInstance = new Pose({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`});
+        poseInstance.setOptions({ modelComplexity: 1, smoothLandmarks: true, minDetectionConfidence: 0.6 });
+        poseInstance.onResults(onResults);
+        setupCamera();
+        updateTrialDisplay();
+    }
+
+    function setupCamera() {
+        if (cameraInstance) cameraInstance.stop();
+        cameraInstance = new Camera(video, {
+            onFrame: async () => { await poseInstance.send({image: video}); },
+            width: 1280, height: 720, facingMode: useFrontCamera ? "user" : "environment"
+        });
+        cameraInstance.start();
+    }
+
+    function onResults(results) {
+        canvas.width = 1280; canvas.height = 720;
+        ctx.save();
+        ctx.clearRect(0,0,1280,720);
+        ctx.drawImage(results.image, 0,0,1280,720);
+
+        if (!results.poseLandmarks) return;
+        let lm = results.poseLandmarks;
+
+        // ランドマーク平滑化
+        if (prevLandmarks) {
+            lm.forEach((point, i) => {
+                point.x = prevLandmarks[i].x * (1 - SMOOTH_LM) + point.x * SMOOTH_LM;
+                point.y = prevLandmarks[i].y * (1 - SMOOTH_LM) + point.y * SMOOTH_LM;
+            });
+        }
+        prevLandmarks = JSON.parse(JSON.stringify(lm));
+
+        const idx = JOINTS[currentPart][currentSide];
+        const p1 = lm[idx[0]], p2 = lm[idx[1]], p3 = lm[idx[2]];
+        if (p1.visibility < 0.5 || p2.visibility < 0.5 || p3.visibility < 0.5) {
+            document.getElementById('status-msg').innerText = "⚠️ 関節を見つけてください";
+            return;
+        }
+
+        // 角度計算
+        let rad = Math.atan2(p3.y-p2.y, p3.x-p2.x) - Math.atan2(p1.y-p2.y, p1.x-p2.x);
+        let deg = Math.abs(rad * 180 / Math.PI);
+        if (deg > 180) deg = 360 - deg;
+        if (currentPart === 'Elbow' || currentPart === 'Knee') deg = 180 - deg;
+        
+        if (smoothAngle === null) smoothAngle = deg;
+        smoothAngle = (smoothAngle * (1 - SMOOTH_ANG)) + (deg * SMOOTH_ANG);
+        let displayDeg = Math.round(smoothAngle);
+
+        if (!isLocked) {
+            document.getElementById('angle-val').innerText = displayDeg + "°";
+            processResearchLogic(deg);
+        }
+
+        // 描画
+        ctx.strokeStyle = isLocked ? "#30d158" : "#0a84ff"; ctx.lineWidth = 8;
+        ctx.beginPath(); ctx.moveTo(p2.x*1280, p2.y*720); ctx.lineTo(p1.x*1280, p1.y*720); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(p2.x*1280, p2.y*720); ctx.lineTo(p3.x*1280, p3.y*720); ctx.stroke();
+        ctx.fillStyle = "#fff";
+        [p1, p2, p3].forEach(p => { ctx.beginPath(); ctx.arc(p.x*1280, p.y*720, 8, 0, 2*Math.PI); ctx.fill(); });
+        ctx.restore();
+    }
+
+    // --- 研究用コアロジック ---
+    function processResearchLogic(rawAngle) {
+        const now = Date.now();
+        const dt = (now - lastTimestamp) / 1000;
+        
+        // 1秒間のバッファを維持
+        angleHistory.push({t: now, val: rawAngle});
+        angleHistory = angleHistory.filter(d => now - d.t < 1500);
+
+        // 角速度による静止判定
+        let velocity = 0;
+        if (lastRawAngle !== null && dt > 0) velocity = Math.abs(rawAngle - lastRawAngle) / dt;
+        
+        lastRawAngle = rawAngle;
+        lastTimestamp = now;
+
+        const bar = document.getElementById('stability-bar');
+        const countTxt = document.getElementById('countdown-txt');
+        const msg = document.getElementById('status-msg');
+
+        if (velocity > VELOCITY_THRES) {
+            stableStartTime = now;
+            bar.style.width = "0%";
+            countTxt.style.display = "none";
+            msg.innerText = "最大屈曲で止まってください";
+            updateProtocol(1);
+        } else {
+            const elapsed = now - stableStartTime;
+            const progress = (elapsed / LOCK_TIME) * 100;
+            bar.style.width = Math.min(progress, 100) + "%";
+            
+            // カウントダウン表示
+            countTxt.style.display = "block";
+            countTxt.innerText = ((LOCK_TIME - elapsed)/1000).toFixed(1);
+            updateProtocol(2);
+
+            if (elapsed >= LOCK_TIME) {
+                // 直前1秒の中央値を採用
+                const resultAngle = calcMedian(BUFFER_WINDOW_MS);
+                executeLock(resultAngle);
+            }
+        }
+    }
+
+    function executeLock(val) {
+        isLocked = true;
+        document.getElementById('lock-overlay').style.display = "block";
+        document.getElementById('countdown-txt').style.display = "none";
+        document.getElementById('angle-val').style.color = "#30d158";
+        updateProtocol(3);
+        
+        saveRecord(val);
+        setTimeout(() => resetForNextTrial(), 2000);
+    }
+
+    function resetForNextTrial() {
+        isLocked = false;
+        smoothAngle = null;
+        document.getElementById('lock-overlay').style.display = "none";
+        document.getElementById('angle-val').style.color = "#fff";
+        updateProtocol(1);
+    }
+
+    // プロトコルUIの更新
+    function updateProtocol(step) {
+        document.querySelectorAll('.step').forEach((el, i) => {
+            el.classList.toggle('active', (i + 1) === step);
+            if (step === 2) el.classList.toggle('recording', (i + 1) === 2);
+        });
+    }
+
+    function calcMedian(ms) {
+        const now = Date.now();
+        const data = angleHistory.filter(d => now - d.t <= ms).map(d => d.val).sort((a,b)=>a-b);
+        if (data.length === 0) return lastRawAngle;
+        const mid = Math.floor(data.length / 2);
+        return data.length % 2 !== 0 ? data[mid] : (data[mid-1] + data[mid]) / 2;
+    }
+
+    function saveRecord(val) {
+        const record = { 
+            trial: currentTrial, 
+            part: currentPart, 
+            side: currentSide, 
+            angle: Math.round(val * 10) / 10, 
+            time: new Date().toLocaleTimeString() 
+        };
+        romData.push(record);
+        localStorage.setItem('rom_research_v3', JSON.stringify(romData));
+        
+        currentTrial++;
+        updateTrialDisplay();
+        document.getElementById('history').innerText = `最新: Trial ${record.trial} - ${record.angle}°`;
+    }
+
+    function undoLast() {
+        if (romData.length === 0) return;
+        if (confirm("最新の試行を削除しますか？")) {
+            romData.pop();
+            localStorage.setItem('rom_research_v3', JSON.stringify(romData));
+            currentTrial = Math.max(1, currentTrial - 1);
+            updateTrialDisplay();
+            document.getElementById('history').innerText = "削除しました";
+        }
+    }
+
+    function updateTrialDisplay() {
+        document.getElementById('trial-display').innerText = `Trial ${currentTrial}`;
+        const labels = {Elbow:'肘', Knee:'膝', Shoulder:'肩', Hip:'股'};
+        document.getElementById('mode-display').innerText = `${currentSide==='R'?'右':'左'} ${labels[currentPart]}`;
+    }
+
+    function changePart(p, btn) {
+        currentPart = p;
+        currentTrial = 1; // 部位変更で試行リセット
+        document.querySelectorAll('.btn-part').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        updateTrialDisplay();
+    }
+
+    function changeSide(s) {
+        currentSide = s;
+        currentTrial = 1; // 左右変更で試行リセット
+        document.querySelectorAll('.btn-side').forEach(b => b.classList.toggle('active', b.id === 'btn-'+s));
+        updateTrialDisplay();
+    }
+
+    function downloadCSV() {
+        if (romData.length === 0) return alert("データなし");
+        let csv = "\ufeffTrial,Part,Side,Angle,Time\n" + romData.map(d => `${d.trial},${d.part},${d.side},${d.angle},${d.time}`).join("\n");
+        const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
+        a.download = `ROM_Research_${new Date().toISOString().slice(0,10)}.csv`; a.click();
+    }
+
+    function toggleCamera() { useFrontCamera = !useFrontCamera; setupCamera(); }
+</script>
+</body>
+</html>
