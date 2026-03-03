@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LiDAR Auto-Loop Measure</title>
+    <style>
+        body { margin: 0; font-family: -apple-system, sans-serif; background: #000; color: #fff; overflow: hidden; }
+        #overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: space-between;
+            align-items: center; pointer-events: none; z-index: 10;
+        }
+        #header { background: rgba(0,0,0,0.7); padding: 25px; width: 100%; text-align: center; border-bottom: 1px solid #333; }
+        #footer { padding-bottom: 50px; display: flex; gap: 15px; pointer-events: auto; }
+        .btn {
+            padding: 18px 35px; font-size: 18px; font-weight: bold; border-radius: 50px;
+            border: none; cursor: pointer; transition: 0.3s; box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        }
+        #start-ar-btn { background: #007AFF; color: white; }
+        #scan-toggle-btn { background: #34C759; color: white; display: none; }
+        #reset-btn { background: #555; color: white; display: none; }
+        .result-box { font-size: 40px; color: #34C759; font-weight: 900; margin-top: 10px; }
+        #status-text { font-size: 16px; color: #00EAFF; font-weight: bold; }
+        .unit { font-size: 20px; margin-left: 5px; color: #fff; }
+    </style>
+</head>
+<body>
+
+    <div id="overlay">
+        <div id="header">
+            <div id="status-text">LiDAR待機中...</div>
+            <div class="result-box"><span id="total-dist">0.0</span><span class="unit">cm</span></div>
+        </div>
+
+        <div id="footer">
+            <button id="start-ar-btn" class="btn">カメラを起動</button>
+            <button id="scan-toggle-btn" class="btn">スキャン開始</button>
+            <button id="reset-btn" class="btn">リセット</button>
+        </div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        let scene, camera, renderer, controller, reticle;
+        let hitTestSource = null, hitTestSourceRequested = false;
+        let points = [], lines = [], spheres = [];
+        let totalCm = 0, isScanning = false, isCompleted = false;
+
+        const startArBtn = document.getElementById('start-ar-btn');
+        const scanBtn = document.getElementById('scan-toggle-btn');
+        const resetBtn = document.getElementById('reset-btn');
+        const distDisplay = document.getElementById('total-dist');
+        const statusText = document.getElementById('status-text');
+
+        // 定数
+        const CLOSE_THRESHOLD = 0.03; // 3cm以内に近づいたら自動結合
+        const MIN_POINTS_TO_CLOSE = 8; // 最低これだけ打たないと閉じない
+        const DROP_INTERVAL = 0.02;   // 2cm動くごとに自動で点を打つ
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            reticle = new THREE.Mesh(
+                new THREE.RingGeometry(0.012, 0.018, 32).rotateX(-Math.PI / 2),
+                new THREE.MeshBasicMaterial({ color: 0x00EAFF })
+            );
+            reticle.matrixAutoUpdate = false;
+            reticle.visible = false;
+            scene.add(reticle);
+
+            startArBtn.addEventListener('click', () => {
+                navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['hit-test'] }).then(onSessionStarted);
+            });
+
+            scanBtn.addEventListener('click', toggleScan);
+            resetBtn.addEventListener('click', resetMeasurement);
+        }
+
+        function onSessionStarted(session) {
+            renderer.xr.setSession(session);
+            startArBtn.style.display = 'none';
+            scanBtn.style.display = 'block';
+            resetBtn.style.display = 'block';
+            statusText.innerText = "脚の周りにレティクルを合わせて開始";
+            renderer.setAnimationLoop(render);
+        }
+
+        function toggleScan() {
+            if (isCompleted) resetMeasurement();
+            isScanning = !isScanning;
+            scanBtn.innerText = isScanning ? "一時停止" : "スキャン再開";
+            scanBtn.style.background = isScanning ? "#FF9500" : "#34C759";
+            statusText.innerText = isScanning ? "ゆっくり一周回ってください..." : "スキャン停止中";
+        }
+
+        function addPoint(pos) {
+            // 最初の点との距離をチェック（自動終了判定）
+            if (points.length >= MIN_POINTS_TO_CLOSE) {
+                const distToStart = pos.distanceTo(points[0]);
+                if (distToStart < CLOSE_THRESHOLD) {
+                    completeMeasurement(pos);
+                    return;
+                }
+            }
+
+            // 一定距離動いたかチェック
+            if (points.length > 0) {
+                const lastPoint = points[points.length - 1];
+                if (pos.distanceTo(lastPoint) < DROP_INTERVAL) return;
+            }
+
+            points.push(pos.clone());
+            const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.005), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+            sphere.position.copy(pos);
+            scene.add(sphere);
+            spheres.push(sphere);
+
+            if (points.length > 1) {
+                const prev = points[points.length - 2];
+                const geometry = new THREE.BufferGeometry().setFromPoints([prev, pos]);
+                const line = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: 0x00EAFF }));
+                scene.add(line);
+                lines.push(line);
+                totalCm += prev.distanceTo(pos) * 100;
+                distDisplay.innerText = totalCm.toFixed(1);
+            }
+        }
+
+        function completeMeasurement(lastPos) {
+            isScanning = false;
+            isCompleted = true;
+            // 最後の点と最初の点を結ぶ
+            const geometry = new THREE.BufferGeometry().setFromPoints([lastPos, points[0]]);
+            const line = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: 0x34C759, linewidth: 3 }));
+            scene.add(line);
+            lines.push(line);
+
+            totalCm += lastPos.distanceTo(points[0]) * 100;
+            distDisplay.innerText = totalCm.toFixed(1);
+            statusText.innerText = "✅ 計測完了！";
+            scanBtn.innerText = "再計測";
+            scanBtn.style.background = "#007AFF";
+        }
+
+        function resetMeasurement() {
+            points = []; totalCm = 0; isCompleted = false; isScanning = false;
+            distDisplay.innerText = "0.0";
+            statusText.innerText = "スキャン準備完了";
+            scanBtn.innerText = "スキャン開始";
+            scanBtn.style.background = "#34C759";
+            lines.forEach(l => scene.remove(l));
+            spheres.forEach(s => scene.remove(s));
+            lines = []; spheres = [];
+        }
+
+        function render(timestamp, frame) {
+            if (frame) {
+                const referenceSpace = renderer.xr.getReferenceSpace();
+                const session = renderer.xr.getSession();
+
+                if (!hitTestSourceRequested) {
+                    session.requestReferenceSpace('viewer').then(ref => {
+                        session.requestHitTestSource({ space: ref }).then(src => hitTestSource = src);
+                    });
+                    hitTestSourceRequested = true;
+                }
+
+                if (hitTestSource) {
+                    const hitResults = frame.getHitTestResults(hitTestSource);
+                    if (hitResults.length) {
+                        const hit = hitResults[0];
+                        const pose = hit.getPose(referenceSpace);
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(pose.transform.matrix);
+
+                        if (isScanning && !isCompleted) {
+                            const currentPos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+                            addPoint(currentPos);
+                        }
+                    } else {
+                        reticle.visible = false;
+                    }
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
